@@ -1,14 +1,18 @@
 """Generate a synthetic core-banking dataset for Lumen Community Bank.
 
-Writes four CSVs to data/raw/:
-    branches.csv        42-branch reference table
-    customers.csv       customer master
-    accounts.csv        deposit accounts
-    daily_balances.csv  one end-of-day balance per account per day
+Writes to data/raw/:
+    branches.csv              42-branch reference table
+    customers.csv             customer master
+    accounts.csv              deposit accounts
+    daily_balances.csv        one end-of-day balance per account per day
+    violations_manifest.json  every planted defect, keyed the way the tests report it
 
 Defects are planted on purpose so the staging step and the test suite have
-something to catch. Every planted defect is listed in PLANTED below and
-printed at the end of a run.
+something to catch. The manifest is built from what was planted, not by
+running the checks, so the tests have an independent answer key.
+
+Row keys in the manifest are the table's primary key. daily_balances uses
+"account_id|balance_date", and a missing key part is written as "<null>".
 
 Output is deterministic for a given seed, except that balance dates end on the
 run date so the freshness SLA in the accounts contract can be checked.
@@ -17,6 +21,7 @@ run date so the freshness SLA in the accounts contract can be checked.
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -25,6 +30,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "data" / "raw"
+NULL_KEY = "<null>"
 
 N_BRANCHES = 42
 N_CUSTOMERS = 1_000
@@ -37,12 +43,14 @@ PLANTED = {
     "accounts.orphan_branch_id": 4,
     "accounts.duplicate_account_id": 3,
     "accounts.null_required": 4,
+    "accounts.invalid_open_date": 2,
     "daily_balances.unknown_account_id": 3,
     "daily_balances.duplicate_pk": 5,
     "daily_balances.null_required": 4,
+    "daily_balances.invalid_ledger_balance": 2,
     "daily_balances.spike_over_300pct": 6,
-    "branches.duplicate_branch_id": 1,
 }
+DUPLICATE_BRANCH_ID = "BR017"
 
 STATES = {
     "IA": ["Des Moines", "Cedar Rapids", "Davenport", "Ames"],
@@ -91,7 +99,7 @@ def make_branches(rng: np.random.Generator) -> pd.DataFrame:
     # that was appended instead of updated. Any join to this table on
     # branch_id fans out and double counts that branch's accounts, which is
     # the failure from last quarter's deposits packet.
-    dup = branches.loc[branches["branch_id"] == "BR017"].copy()
+    dup = branches.loc[branches["branch_id"] == DUPLICATE_BRANCH_ID].copy()
     dup["branch_name"] = dup["branch_name"] + " (Relocated)"
     return pd.concat([branches, dup], ignore_index=True)
 
@@ -147,12 +155,12 @@ def make_accounts(rng: np.random.Generator, customers: pd.DataFrame, branch_ids:
 
 
 def plant_account_defects(rng: np.random.Generator, accounts: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Corrupt a few account rows. Returns the table and the affected ids."""
+    """Corrupt a few account rows. Returns the table and the affected account_ids."""
     accounts = accounts.astype({"customer_id": object, "branch_id": object,
                                 "account_type": object, "open_date": object})
     pool = list(rng.permutation(len(accounts)))
     take = lambda k: [pool.pop() for _ in range(k)]  # noqa: E731
-    planted: dict[str, list[str]] = {}
+    planted: dict = {}
 
     idx = take(PLANTED["accounts.orphan_customer_id"])
     accounts.loc[idx, "customer_id"] = [f"C9{i:04d}" for i in range(len(idx))]
@@ -163,9 +171,17 @@ def plant_account_defects(rng: np.random.Generator, accounts: pd.DataFrame) -> t
     planted["orphan_branch_id"] = accounts.loc[idx, "account_id"].tolist()
 
     idx = take(PLANTED["accounts.null_required"])
+    planted["null_required"] = {}
     for i, col in zip(idx, ["customer_id", "account_type", "open_date", "branch_id"]):
         accounts.loc[i, col] = None
-    planted["null_required"] = accounts.loc[idx, "account_id"].tolist()
+        planted["null_required"].setdefault(col, []).append(accounts.loc[i, "account_id"])
+
+    # Wrong type: a US-style date from a spreadsheet export instead of ISO 8601.
+    idx = take(PLANTED["accounts.invalid_open_date"])
+    for i in idx:
+        d = date.fromisoformat(accounts.loc[i, "open_date"])
+        accounts.loc[i, "open_date"] = f"{d.month:02d}/{d.day:02d}/{d.year}"
+    planted["invalid_open_date"] = accounts.loc[idx, "account_id"].tolist()
 
     # Duplicate keys: re-emit an existing account_id with a different type,
     # as a buggy upsert would. Neither copy can be trusted over the other.
@@ -194,58 +210,99 @@ def make_balances(rng: np.random.Generator, accounts: pd.DataFrame, today: date)
         "account_id": np.repeat(ids, N_DAYS),
         "balance_date": np.tile([d.isoformat() for d in days], len(ids)),
         "ledger_balance": ledger.ravel(),
-        "available_balance": (ledger - holds).ravel(),
+        "available_balance": np.round(ledger - holds, 2).ravel(),
     })
+
+
+def bal_key(account_id: str | None, balance_date: str | None) -> str:
+    return f"{account_id or NULL_KEY}|{balance_date or NULL_KEY}"
 
 
 def plant_balance_defects(rng: np.random.Generator, balances: pd.DataFrame,
                           skip_accounts: set[str]) -> tuple[pd.DataFrame, dict]:
-    balances = balances.astype({"ledger_balance": object, "available_balance": object})
-    planted: dict[str, list[str]] = {}
-
-    # Pick target accounts that are otherwise clean, so each defect has a
-    # single cause.
+    """Corrupt a few balance rows. Returns the table and the affected row keys."""
     candidates = sorted(set(balances["account_id"]) - skip_accounts)
-    chosen = list(rng.choice(candidates, size=PLANTED["daily_balances.spike_over_300pct"]
-                             + PLANTED["daily_balances.null_required"]
-                             + PLANTED["daily_balances.duplicate_pk"], replace=False))
+    # Copy a clean series for the ghost accounts before anything is corrupted.
+    ghost_template = balances[balances["account_id"] == candidates[0]].copy()
+
+    balances = balances.astype({"account_id": object, "balance_date": object,
+                                "ledger_balance": object, "available_balance": object})
+    planted: dict = {}
+
+    # Each defect goes on a different otherwise-clean account, so every
+    # planted row has exactly one cause.
+    n_targets = sum(PLANTED[k] for k in ("daily_balances.spike_over_300pct",
+                                         "daily_balances.null_required",
+                                         "daily_balances.duplicate_pk",
+                                         "daily_balances.invalid_ledger_balance"))
+    chosen = list(rng.choice(candidates[1:], size=n_targets, replace=False))
+
+    def pick_row(acct: str, lo: int = 0, hi: int | None = None) -> int:
+        rows = balances.index[balances["account_id"] == acct]
+        return rows[int(rng.integers(lo, hi if hi is not None else len(rows)))]
 
     # Spikes: one day where the balance jumps to 5-8x the previous day, as if
     # an amount was keyed in cents instead of dollars or a decimal was lost.
-    spike_ids = [chosen.pop() for _ in range(PLANTED["daily_balances.spike_over_300pct"])]
-    for acct in spike_ids:
-        rows = balances.index[balances["account_id"] == acct]
-        i = rows[int(rng.integers(10, len(rows) - 1))]
+    planted["spike_over_300pct"] = []
+    for _ in range(PLANTED["daily_balances.spike_over_300pct"]):
+        acct = chosen.pop()
+        i = pick_row(acct, 10, N_DAYS - 1)
         factor = float(rng.uniform(5, 8))
         balances.loc[i, "ledger_balance"] = round(balances.loc[i - 1, "ledger_balance"] * factor, 2)
         balances.loc[i, "available_balance"] = balances.loc[i, "ledger_balance"]
-    planted["spike_over_300pct"] = spike_ids
+        planted["spike_over_300pct"].append(bal_key(acct, balances.loc[i, "balance_date"]))
 
-    null_ids = [chosen.pop() for _ in range(PLANTED["daily_balances.null_required"])]
-    for acct, col in zip(null_ids, ["ledger_balance", "balance_date", "ledger_balance", "account_id"]):
-        rows = balances.index[balances["account_id"] == acct]
-        balances.loc[rows[int(rng.integers(0, len(rows)))], col] = None
-    planted["null_required"] = null_ids
+    planted["null_required"] = {}
+    for col in ["ledger_balance", "balance_date", "available_balance", "account_id"]:
+        acct = chosen.pop()
+        i = pick_row(acct)
+        balances.loc[i, col] = None
+        key = bal_key(balances.loc[i, "account_id"], balances.loc[i, "balance_date"])
+        planted["null_required"].setdefault(col, []).append(key)
+
+    # Wrong type: a balance formatted with a thousands separator.
+    planted["invalid_ledger_balance"] = []
+    for _ in range(PLANTED["daily_balances.invalid_ledger_balance"]):
+        acct = chosen.pop()
+        i = pick_row(acct)
+        balances.loc[i, "ledger_balance"] = f"{float(balances.loc[i, 'ledger_balance']) + 1000:,.2f}"
+        planted["invalid_ledger_balance"].append(bal_key(acct, balances.loc[i, "balance_date"]))
 
     # Duplicate (account_id, balance_date): a reloaded day with a slightly
     # different figure.
-    dup_ids = [chosen.pop() for _ in range(PLANTED["daily_balances.duplicate_pk"])]
     dup_rows = []
-    for acct in dup_ids:
-        rows = balances.index[balances["account_id"] == acct]
-        row = balances.loc[rows[int(rng.integers(0, len(rows)))]].copy()
+    planted["duplicate_pk"] = []
+    for _ in range(PLANTED["daily_balances.duplicate_pk"]):
+        acct = chosen.pop()
+        row = balances.loc[pick_row(acct)].copy()
         row["ledger_balance"] = round(row["ledger_balance"] + 100.0, 2)
         dup_rows.append(row)
-    planted["duplicate_pk"] = dup_ids
+        planted["duplicate_pk"].append(bal_key(acct, row["balance_date"]))
 
     # Balances for accounts that do not exist in accounts.csv.
-    unknown = [f"A9{i:05d}" for i in range(PLANTED["daily_balances.unknown_account_id"])]
-    template = balances[balances["account_id"] == candidates[0]]
-    ghost_rows = [template.assign(account_id=acct) for acct in unknown]
-    planted["unknown_account_id"] = unknown
+    ghosts = [ghost_template.assign(account_id=f"A9{i:05d}")
+              for i in range(PLANTED["daily_balances.unknown_account_id"])]
+    planted["unknown_account_id"] = [bal_key(a, d) for g in ghosts
+                                     for a, d in zip(g["account_id"], g["balance_date"])]
 
-    out = pd.concat([balances, pd.DataFrame(dup_rows), *ghost_rows], ignore_index=True)
+    out = pd.concat([balances, pd.DataFrame(dup_rows), *ghosts], ignore_index=True)
     return out, planted
+
+
+def expected_fanout(branches: pd.DataFrame, accounts: pd.DataFrame,
+                    balances: pd.DataFrame) -> dict:
+    """Rows a daily_balances -> accounts -> branches left join adds, from the planted duplicates.
+
+    Each balance row turns into (account rows for its id) x (branch rows for
+    each of those accounts' branch_id) rows; an unmatched key still yields one.
+    """
+    branch_rows = branches["branch_id"].value_counts()
+    per_account = accounts.groupby("account_id")["branch_id"].agg(
+        lambda s: sum(int(branch_rows.get(b, 1)) for b in s))
+    bal_rows = balances["account_id"].value_counts()
+    fanned = sorted(a for a in bal_rows.index if per_account.get(a, 1) > 1)
+    extra = sum(int(bal_rows[a]) * (int(per_account[a]) - 1) for a in fanned)
+    return {"account_ids": fanned, "extra_rows": extra}
 
 
 def main() -> None:
@@ -262,26 +319,59 @@ def main() -> None:
     branch_ids = branches["branch_id"].drop_duplicates().tolist()
     customers = make_customers(rng, branch_ids, today)
     accounts = make_accounts(rng, customers, branch_ids, today)
-    accounts, acct_planted = plant_account_defects(rng, accounts)
+    accounts, acct = plant_account_defects(rng, accounts)
 
     balances = make_balances(rng, accounts, today)
-    bad_accounts = {a for ids in acct_planted.values() for a in ids}
-    balances, bal_planted = plant_balance_defects(rng, balances, bad_accounts)
+    bad_accounts = {a for v in acct.values() for a in (v if isinstance(v, list) else sum(v.values(), []))}
+    balances, bal = plant_balance_defects(rng, balances, bad_accounts)
 
     tables = {"branches": branches, "customers": customers,
               "accounts": accounts, "daily_balances": balances}
     for name, df in tables.items():
         df.to_csv(args.out / f"{name}.csv", index=False)
 
-    print(f"Wrote raw tables to {args.out.relative_to(ROOT) if args.out.is_relative_to(ROOT) else args.out}"
-          f" (seed={args.seed}, as-of {today.isoformat()})")
+    s = sorted
+    manifest = {
+        "seed": args.seed,
+        "as_of": today.isoformat(),
+        "schema": {
+            "accounts": {"open_date": s(acct["invalid_open_date"])},
+            "daily_balances": {"ledger_balance": s(bal["invalid_ledger_balance"])},
+        },
+        "pk": {
+            "branches": [DUPLICATE_BRANCH_ID],
+            "customers": [],
+            "accounts": s(acct["duplicate_account_id"]),
+            "daily_balances": s(bal["duplicate_pk"]),
+        },
+        "relationships": {
+            "accounts.customer_id": s(acct["orphan_customer_id"]),
+            "accounts.branch_id": s(acct["orphan_branch_id"]),
+            "customers.home_branch_id": [],
+            "daily_balances.account_id": s(bal["unknown_account_id"]),
+        },
+        "join_fanout": expected_fanout(branches, accounts, balances),
+        "not_null": {
+            "accounts": {c: s(v) for c, v in acct["null_required"].items()},
+            "daily_balances": {c: s(v) for c, v in bal["null_required"].items()},
+        },
+        "business": {"balance_move_over_300pct": s(bal["spike_over_300pct"])},
+    }
+    (args.out / "violations_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    shown = args.out.relative_to(ROOT) if args.out.is_relative_to(ROOT) else args.out
+    print(f"Wrote raw tables to {shown} (seed={args.seed}, as-of {today.isoformat()})")
     for name, df in tables.items():
-        print(f"  {name + '.csv':<20} {len(df):>7,} rows")
+        print(f"  {name + '.csv':<26} {len(df):>7,} rows")
+    print("  violations_manifest.json")
     print("Planted defects:")
-    print(f"  {'branches.duplicate_branch_id':<36} BR017")
-    for prefix, planted in (("accounts", acct_planted), ("daily_balances", bal_planted)):
+    print(f"  {'branches.duplicate_branch_id':<38} {DUPLICATE_BRANCH_ID}")
+    for prefix, planted in (("accounts", acct), ("daily_balances", bal)):
         for kind, ids in planted.items():
-            print(f"  {prefix + '.' + kind:<36} {', '.join(ids)}")
+            if isinstance(ids, dict):
+                ids = [f"{k} ({c})" for c, ks in ids.items() for k in ks]
+            more = f" ... (+{len(ids) - 5} more)" if len(ids) > 5 else ""
+            print(f"  {prefix + '.' + kind:<38} {', '.join(ids[:5])}{more}")
 
 
 if __name__ == "__main__":

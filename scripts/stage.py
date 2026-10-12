@@ -27,9 +27,19 @@ STAGED_DIR = ROOT / "data" / "staged"
 
 SPIKE_THRESHOLD = 3.0  # flag a day-over-day move greater than 300%
 
-ACCOUNTS_REQUIRED = ["account_id", "customer_id", "branch_id", "account_type", "open_date"]
-BALANCES_REQUIRED = ["account_id", "balance_date", "ledger_balance"]
+ACCOUNTS_REQUIRED = ["account_id", "customer_id", "branch_id", "account_type", "status",
+                     "open_date", "currency", "updated_at"]
+BALANCES_REQUIRED = ["account_id", "balance_date", "ledger_balance", "available_balance"]
 BALANCES_PK = ["account_id", "balance_date"]
+
+# Typed columns and the exact text format each must match.
+DATE = r"\d{4}-\d{2}-\d{2}"
+ACCOUNTS_TYPES = {"open_date": ("date", DATE), "interest_rate": ("decimal", r"-?\d+(\.\d+)?"),
+                  "updated_at": ("datetime", DATE + r"T\d{2}:\d{2}:\d{2}")}
+BALANCES_TYPES = {"balance_date": ("date", DATE),
+                  "ledger_balance": ("decimal", r"-?\d+(\.\d+)?"),
+                  "available_balance": ("decimal", r"-?\d+(\.\d+)?")}
+DATE_FORMATS = {"date": "%Y-%m-%d", "datetime": "%Y-%m-%dT%H:%M:%S"}
 
 
 def read(path: Path) -> pd.DataFrame:
@@ -47,10 +57,22 @@ def null_reasons(df: pd.DataFrame, required: list[str], reasons: pd.Series) -> N
         add_reason(reasons, df[col].isna(), f"null_required:{col}")
 
 
+def type_reasons(df: pd.DataFrame, types: dict, reasons: pd.Series) -> None:
+    for col, (kind, pattern) in types.items():
+        present = df[col].notna()
+        bad = present & ~df[col].fillna("").str.fullmatch(pattern)
+        if kind in DATE_FORMATS:  # well formed but not a real date, e.g. 2026-02-30
+            parsed = pd.to_datetime(df[col].where(present & ~bad), format=DATE_FORMATS[kind],
+                                    errors="coerce")
+            bad |= present & parsed.isna()
+        add_reason(reasons, bad, f"invalid_type:{col}")
+
+
 def check_accounts(accounts: pd.DataFrame, customers: pd.DataFrame,
                    branches: pd.DataFrame) -> pd.Series:
     reasons = pd.Series([[] for _ in range(len(accounts))], index=accounts.index)
     null_reasons(accounts, ACCOUNTS_REQUIRED, reasons)
+    type_reasons(accounts, ACCOUNTS_TYPES, reasons)
 
     # Every copy of a duplicated key is quarantined: there is no way to know
     # which version is correct.
@@ -68,6 +90,7 @@ def check_balances(balances: pd.DataFrame, raw_accounts: pd.DataFrame,
                    clean_account_ids: pd.Series) -> pd.Series:
     reasons = pd.Series([[] for _ in range(len(balances))], index=balances.index)
     null_reasons(balances, BALANCES_REQUIRED, reasons)
+    type_reasons(balances, BALANCES_TYPES, reasons)
 
     pk_complete = balances[BALANCES_PK].notna().all(axis=1)
     add_reason(reasons, pk_complete & balances.duplicated(BALANCES_PK, keep=False), "duplicate_pk")
@@ -81,8 +104,8 @@ def check_balances(balances: pd.DataFrame, raw_accounts: pd.DataFrame,
     add_reason(reasons, acct.notna() & ~unknown & ~acct.isin(clean_account_ids),
                "parent_account_quarantined")
 
-    # Business rule: run on rows that passed every other check, so a null or
-    # duplicate cannot create or hide a spike.
+    # Business rule: run on rows that passed every other check, so a null,
+    # duplicate or malformed number cannot create or hide a spike.
     ok = reasons.map(len) == 0
     series = balances.loc[ok, BALANCES_PK].copy()
     series["ledger"] = pd.to_numeric(balances.loc[ok, "ledger_balance"])

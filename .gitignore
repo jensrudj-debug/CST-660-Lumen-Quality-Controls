@@ -42,3 +42,4 @@ Thumbs.db
 data/raw/*.csv
 data/staged/*.csv
 data/staged/quarantine/*.csv
+data/raw/*.json
