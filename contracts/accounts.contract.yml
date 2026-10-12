@@ -1,0 +1,124 @@
+# Data contract: accounts
+#
+# The agreement between the team that produces the accounts table and the team
+# that consumes it. It states what the table must look like (columns, types,
+# nullability, allowed values), how fresh it must be, and how it may change.
+# scripts/validate_contract.py checks the staged table against this file and
+# exits non-zero on any violation, which blocks the pull request in CI.
+#
+# Changing this file is itself governed by breaking_change_policy below.
+
+contract:
+  name: accounts
+  version: 1.0.0
+  description: >-
+    One row per deposit account held at Lumen Community Bank, as delivered
+    after staging. Source of account attributes for deposits reporting.
+  dataset: data/staged/accounts.csv
+  format: csv
+
+producer:
+  team: Core Banking Data Engineering
+  responsibilities:
+    - Deliver data/staged/accounts.csv conforming to this contract.
+    - Announce any change under breaking_change_policy before it ships.
+
+consumers:
+  - team: Finance Analytics
+    use: CFO weekly deposits packet
+    relies_on: [account_id, branch_id, account_type, status, open_date]
+
+schema:
+  primary_key: [account_id]
+  columns:
+    - name: account_id
+      type: string
+      nullable: false
+      primary_key: true
+      pattern: '^A\d{6}$'
+      description: Unique account identifier.
+
+    - name: customer_id
+      type: string
+      nullable: false
+      pattern: '^C\d{5}$'
+      foreign_key: {table: customers, column: customer_id}
+      description: Account holder.
+
+    - name: branch_id
+      type: string
+      nullable: false
+      pattern: '^BR\d{3}$'
+      # Branch ids are written as BR001-BR042; the range applies to the number.
+      range: {min: 1, max: 42, applies_to: numeric_part}
+      foreign_key: {table: branches, column: branch_id}
+      description: Branch that holds the account.
+
+    - name: account_type
+      type: string
+      nullable: false
+      allowed_values: [CHECKING, SAVINGS, MONEY_MARKET, CD]
+      description: Deposit product.
+
+    - name: status
+      type: string
+      nullable: false
+      allowed_values: [OPEN, DORMANT, CLOSED]
+      description: Lifecycle status of the account.
+
+    - name: open_date
+      type: date
+      format: '%Y-%m-%d'
+      nullable: false
+      not_in_future: true
+      description: Date the account was opened.
+
+    - name: currency
+      type: string
+      nullable: false
+      allowed_values: [USD]
+      description: ISO 4217 currency code.
+
+    - name: interest_rate
+      type: decimal
+      nullable: true
+      range: {min: 0.0, max: 10.0}
+      description: Annual percentage rate. Null for non-interest-bearing products.
+
+    - name: updated_at
+      type: datetime
+      format: '%Y-%m-%dT%H:%M:%S'
+      nullable: false
+      description: When the producer last changed this row. Drives the freshness SLA.
+
+freshness:
+  column: updated_at
+  max_age_hours: 24
+  measured_against: run_time  # the time the validator runs
+  description: >-
+    The most recent updated_at must be no more than 24 hours before the run.
+    A stale maximum means the producer's load did not run, not that accounts
+    stopped changing.
+
+breaking_change_policy:
+  versioning: semver
+  major:
+    breaking: true
+    requires: [major_version_bump, consumer_sign_off]
+    changes:
+      - remove a column
+      - rename a column
+      - change a column's type
+      - change nullable from true to false
+      - remove an allowed enum value
+  minor:
+    breaking: false
+    requires: [minor_version_bump]
+    changes:
+      - add a nullable column
+      - add an allowed enum value
+  patch:
+    breaking: false
+    requires: [patch_version_bump]
+    changes:
+      - change a description
