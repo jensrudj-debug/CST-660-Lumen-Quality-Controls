@@ -23,6 +23,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Never open a pager: the demo runs unattended between Enter presses, and a
+# pager (less) would sit at "(END)" waiting for "q" and swallow the keypresses.
+export GIT_PAGER=cat GH_PAGER=cat PAGER=cat
+
 REPO="jensrudj-debug/CST-660-Lumen-Quality-Controls"
 CHECK_ONLY=false
 [[ "${1:-}" == "--check" ]] && CHECK_ONLY=true
@@ -269,7 +273,7 @@ bad "Promoted to staging as $BAD_TAG. Staging now reports deposits 100x too high
 
 pause "follow the rollback runbook: find the last good tag"
 step "6. Roll staging back"
-run git tag -l 'staging-*' --sort=-creatordate --format='%(refname:short)  %(creatordate:iso)  %(subject)'
+run git --no-pager tag -l 'staging-*' --sort=-creatordate --format='%(refname:short)  %(creatordate:iso)  %(subject)'
 say "Bad release: $BAD_TAG    Last good release: $GOOD_TAG"
 pause "run the rollback workflow with $GOOD_TAG"
 BEFORE=$(gh run list --workflow rollback.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
