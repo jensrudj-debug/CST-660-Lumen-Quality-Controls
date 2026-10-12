@@ -100,6 +100,10 @@ def make_branches(rng: np.random.Generator) -> pd.DataFrame:
     # the failure from last quarter's deposits packet.
     if not branches["branch_id"].is_unique:
         raise ValueError("branches.branch_id must be unique")
+    # Branch renames from the regional feed, loaded as new rows.
+    renamed = branches[branches["branch_id"].isin(["BR005", "BR017", "BR031"])].copy()
+    renamed["branch_name"] = "Lumen Community Bank " + renamed["city"]
+    branches = pd.concat([branches, renamed], ignore_index=True)
     return branches
 
 
