@@ -263,8 +263,49 @@ or its consumers are wrong.
 
 ### Failing PR: a deliberate contract break blocked by the gate
 
-<!-- PR link, the failing check, and the violation output -->
+**Pull request:** [#2 feat: switch to regional branch codes](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/pull/2)
+
+A simulated careless producer change: branch_id switched from `BR017` to
+`BR-017` without updating the contract (still v1.0.0), and three branch
+renames loaded as new rows, so `BR-005`, `BR-017` and `BR-031` each appeared
+twice in the branch reference table.
+
+**Failing run:** [CI #3 on commit `cba8f3d`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38197754895).
+Both required checks failed, `promote-staging` was skipped and branch
+protection blocked the merge.
+
+| Check | Result | Failure |
+|---|---|---|
+| `contract-validation` | ❌ | `[CONTRACT VIOLATION] pattern(branch_id): 1482 value(s) do not match ^BR\d{3}$` |
+| `tests` | ❌ | `branches: primary key (branch_id) must be unique: 3 offending key(s): [BR-005, BR-017, BR-031]` |
+| | | `daily_balances -> accounts -> branches join must preserve row count: expected 44,269 rows, got 47,027 (+2,758)` |
+| | | raw duplicate keys did not match `violations_manifest.json` (found `BR-005, BR-017, BR-031`, expected `BR017`) |
+
+Two root causes, fixed separately at the source in the generator, with no
+test or validator changes:
+
+1. [`6555707`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/commit/6555707) fix: keep one row per branch_id in the branch reference table. Cleared all three `tests` failures.
+2. [`028e879`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/commit/028e879) fix: restore contracted branch_id type. Cleared the contract violation.
+
+![Failing CI run for PR #2: tests and contract-validation failed, promote-staging skipped](docs/evidence/Failed%20PR.png)
 
 ### Passing PR: the fix merges and promotes to staging
 
-<!-- PR link, green checks, merge, and the staging-* tag created -->
+**PR #2 after the fixes:** [CI #4 on commit `028e879`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38199135136).
+`tests` passed (61 passed) and `contract-validation` passed (0 violations in
+1,482 rows), so the merge was allowed.
+
+**Merge to main:** [CI #5 on merge commit `bba34bf`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38199283614).
+Both checks passed again on `main` and `promote-staging` uploaded the staged
+data and created the tag
+[`staging-bba34bf`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/tree/staging-bba34bf).
+
+![Passing CI run for the merge of PR #2: tests, contract-validation and promote-staging succeeded, promoted as staging-bba34bf](docs/evidence/Successful%20PR.png)
+
+**README pull request:** [#1 docs: add README and rollback runbook](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/pull/1)
+
+| Run | Commit | Result |
+|---|---|---|
+| [CI #2](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38197392583) | `8d5c345` | ❌ `tests` failed on the duplicate `BR017` then present on `main`; merge blocked |
+| [CI #6](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38199344748) | `a1c207c` | ✅ passed after updating the branch from `main` with the fix |
+| [CI #7](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38199385395) | `7c0e732` (merge) | ✅ passed on `main`; promoted as [`staging-7c0e732`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/tree/staging-7c0e732) |
