@@ -1,0 +1,115 @@
+# Rollback path for the staging environment.
+#
+# Run manually from the Actions tab (or `gh workflow run rollback.yml -f
+# ref=staging-<sha>`) with a staging-* tag that CI created on an earlier
+# promotion. The workflow checks out that tag, regenerates and stages the data
+# from that version of the code, reruns both checks, and redeploys the result
+# to the staging environment. Nothing is deployed unless both checks pass.
+
+name: Rollback staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Previous staging tag to restore, e.g. staging-1a2b3c4"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-ref:
+    name: verify-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check the ref is an existing staging tag
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if [[ ! "$REF" =~ ^staging-[0-9a-f]{7,40}$ ]]; then
+            echo "::error::'$REF' is not a staging-<sha> tag"; exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$REF" >/dev/null; then
+            echo "::error::tag '$REF' does not exist"; exit 1
+          fi
+
+  # Job names differ from ci.yml so these runs are never mistaken for the
+  # required PR checks.
+  rollback-tests:
+    name: rollback-tests
+    needs: verify-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Generate and stage data
+        run: make generate stage
+      - name: Run test suite
+        run: python -m pytest tests -v
+
+  rollback-contract-validation:
+    name: rollback-contract-validation
+    needs: verify-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Generate and stage data
+        run: make generate stage
+      - name: Validate accounts contract
+        # Compare the contract with itself, not with origin/main: restoring an
+        # older contract is a deliberate rollback, and against a newer main it
+        # would look like a breaking change and block the restore.
+        run: python scripts/validate_contract.py --base-ref HEAD
+
+  redeploy-staging:
+    name: redeploy-staging
+    needs: [rollback-tests, rollback-contract-validation]
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Generate and stage data
+        run: make generate stage
+      - name: Upload staged data
+        uses: actions/upload-artifact@v7
+        with:
+          name: staging-data-rollback-${{ inputs.ref }}-${{ github.run_id }}
+          path: data/staged/
+          if-no-files-found: error
+      - name: Summary
+        env:
+          REF: ${{ inputs.ref }}
+        run: echo "Rolled staging back to $REF ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
