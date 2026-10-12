@@ -28,8 +28,15 @@ failure class into automated controls that run on every change:
   any failure, so a bad change cannot reach the packet unnoticed.
 
 The data is synthetic. The generator plants defects on purpose (orphaned keys,
-duplicate keys, nulls, wrong types, balance spikes and a duplicated branch_id)
-so every control can be shown catching a real problem.
+duplicate keys, nulls, wrong types and balance spikes) so every control can be
+shown catching a real problem.
+
+The generator originally also planted a duplicated branch_id (`BR017`) in the
+branch reference table, reproducing the incident's root cause. That is now
+fixed at the source ([PR #2](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/pull/2)):
+the branch table has exactly one row per branch_id, and the generator refuses
+to write one with a repeated key. The primary-key and fan-out tests still
+guard against it coming back.
 
 ## 2. Architecture
 
@@ -309,3 +316,31 @@ data and created the tag
 | [CI #2](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38197392583) | `8d5c345` | ❌ `tests` failed on the duplicate `BR017` then present on `main`; merge blocked |
 | [CI #6](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38199344748) | `a1c207c` | ✅ passed after updating the branch from `main` with the fix |
 | [CI #7](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38199385395) | `7c0e732` (merge) | ✅ passed on `main`; promoted as [`staging-7c0e732`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/tree/staging-7c0e732) |
+
+### Rollback dry run: restoring an earlier staging tag
+
+**Run:** [Rollback staging on `staging-bba34bf`](https://github.com/jensrudj-debug/CST-660-Lumen-Quality-Controls/actions/runs/38201112500),
+following steps 2, 3 and 5 of the [Rollback Runbook](#7-rollback-runbook).
+
+1. **Find the last good tag (step 2).** `git tag -l 'staging-*' --sort=-creatordate`
+   listed `staging-32f1637` (current), `staging-7c0e732` and
+   `staging-bba34bf`. The oldest, `staging-bba34bf`, was chosen. It differs from
+   the current tag only in documentation, so the rollback exercised every step
+   without changing staging's data.
+2. **Run the rollback workflow (step 3).** `gh workflow run rollback.yml -f ref=staging-bba34bf`
+
+   | Job | Result | Evidence from the log |
+   |---|---|---|
+   | `verify-ref` | ✅ | Tag matches `staging-<sha>` and exists |
+   | `rollback-tests` | ✅ | `HEAD is now at bba34bf`; `61 passed` |
+   | `rollback-contract-validation` | ✅ | Contract compared with itself at the tag; `PASSED: 0 contract violations in 1,482 rows` |
+   | `redeploy-staging` | ✅ | Artifact `staging-data-rollback-staging-bba34bf-38201112500` uploaded to the `staging` environment |
+
+3. **Verify (step 5).** The redeployed artifact was downloaded with
+   `gh run download` and validated independently: `PASSED: 0 contract violations
+   in 1,482 rows` (validator exit code 0), and `branches.csv` had 42 rows with no
+   duplicate branch_id.
+
+Step 4 (reverting a merge through a pull request) was skipped because nothing
+was broken, and step 6 (notify) is a human step. The next merge to `main`
+promotes the latest commit to staging again.
