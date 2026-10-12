@@ -1,0 +1,94 @@
+# CI gate for Lumen data quality controls.
+#
+# On every pull request to main: run the test suite and validate the accounts
+# data contract. Branch protection requires the "tests" and
+# "contract-validation" jobs, so a failure in either blocks the merge.
+#
+# On every push to main (a merged PR): rerun both checks, then promote the
+# staged data to the staging environment and tag the commit staging-<sha>.
+# To roll back, run the "Rollback staging" workflow with a previous tag
+# (see rollback.yml).
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Generate and stage data
+        run: make generate stage
+      - name: Run test suite
+        run: python -m pytest tests -v
+
+  contract-validation:
+    name: contract-validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so origin/main exists for the breaking-change check.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Generate and stage data
+        run: make generate stage
+      - name: Validate accounts contract
+        run: python scripts/validate_contract.py
+
+  promote-staging:
+    name: promote-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [tests, contract-validation]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: write
+    # Never let a promotion and a rollback deploy at the same time.
+    concurrency:
+      group: staging-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Generate and stage data
+        run: make generate stage
+      - name: Upload staged data
+        uses: actions/upload-artifact@v7
+        with:
+          name: staging-data-${{ github.sha }}
+          path: data/staged/
+          if-no-files-found: error
+      - name: Tag release
+        run: |
+          tag="staging-${GITHUB_SHA::7}"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "$tag"
+          echo "Promoted $GITHUB_SHA to staging as $tag" >> "$GITHUB_STEP_SUMMARY"
