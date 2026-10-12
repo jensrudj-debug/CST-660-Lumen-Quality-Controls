@@ -86,7 +86,7 @@ def make_branches(rng: np.random.Generator) -> pd.DataFrame:
         state, city = cities[i % len(cities)]
         suffix = "" if i < len(cities) else " West"
         rows.append({
-            "branch_id": f"BR{i + 1:03d}",
+            "branch_id": f"BR-{i + 1:03d}",
             "branch_name": f"Lumen {city}{suffix}",
             "city": city,
             "state": state,
@@ -99,8 +99,8 @@ def make_branches(rng: np.random.Generator) -> pd.DataFrame:
     # that was appended instead of updated. Any join to this table on
     # branch_id fans out and double counts that branch's accounts, which is
     # the failure from last quarter's deposits packet.
-    dup = branches.loc[branches["branch_id"] == DUPLICATE_BRANCH_ID].copy()
-    dup["branch_name"] = dup["branch_name"] + " (Relocated)"
+    dup = branches.loc[branches["branch_id"].isin(["BR-005", "BR-017", "BR-031"])].copy()
+    dup["branch_name"] = dup["branch_name"].str.replace("Lumen ", "Lumen Community Bank ")
     return pd.concat([branches, dup], ignore_index=True)
 
 
