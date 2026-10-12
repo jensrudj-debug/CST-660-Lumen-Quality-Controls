@@ -50,7 +50,6 @@ PLANTED = {
     "daily_balances.invalid_ledger_balance": 2,
     "daily_balances.spike_over_300pct": 6,
 }
-DUPLICATE_BRANCH_ID = "BR017"
 
 STATES = {
     "IA": ["Des Moines", "Cedar Rapids", "Davenport", "Ames"],
@@ -95,13 +94,13 @@ def make_branches(rng: np.random.Generator) -> pd.DataFrame:
         })
     branches = pd.DataFrame(rows)
 
-    # Defect: a second row for an existing branch_id, like a re-keyed branch
-    # that was appended instead of updated. Any join to this table on
-    # branch_id fans out and double counts that branch's accounts, which is
+    # branches is a reference table: exactly one row per branch_id. A rename
+    # updates the existing row; appending a second row would make every join
+    # on branch_id fan out and double count that branch's balances, which is
     # the failure from last quarter's deposits packet.
-    dup = branches.loc[branches["branch_id"] == DUPLICATE_BRANCH_ID].copy()
-    dup["branch_name"] = dup["branch_name"] + " (Relocated)"
-    return pd.concat([branches, dup], ignore_index=True)
+    if not branches["branch_id"].is_unique:
+        raise ValueError("branches.branch_id must be unique")
+    return branches
 
 
 def make_customers(rng: np.random.Generator, branch_ids: list[str], today: date) -> pd.DataFrame:
@@ -339,7 +338,7 @@ def main() -> None:
             "daily_balances": {"ledger_balance": s(bal["invalid_ledger_balance"])},
         },
         "pk": {
-            "branches": [DUPLICATE_BRANCH_ID],
+            "branches": [],
             "customers": [],
             "accounts": s(acct["duplicate_account_id"]),
             "daily_balances": s(bal["duplicate_pk"]),
@@ -365,7 +364,6 @@ def main() -> None:
         print(f"  {name + '.csv':<26} {len(df):>7,} rows")
     print("  violations_manifest.json")
     print("Planted defects:")
-    print(f"  {'branches.duplicate_branch_id':<38} {DUPLICATE_BRANCH_ID}")
     for prefix, planted in (("accounts", acct), ("daily_balances", bal)):
         for kind, ids in planted.items():
             if isinstance(ids, dict):
