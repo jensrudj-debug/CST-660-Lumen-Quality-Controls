@@ -203,7 +203,7 @@ def make_balances(rng: np.random.Generator, accounts: pd.DataFrame, today: date)
     steps[:, 0] = 0.0
     walk = start[:, None] * np.cumprod(1 + steps, axis=1)
 
-    ledger = np.round(walk, 2)
+    ledger = np.round(walk * 100, 2)  # core banking now reports minor units
     holds = np.round(ledger * rng.uniform(0, 0.03, size=ledger.shape), 2)
     return pd.DataFrame({
         "account_id": np.repeat(ids, N_DAYS),
