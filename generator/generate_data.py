@@ -85,7 +85,7 @@ def make_branches(rng: np.random.Generator) -> pd.DataFrame:
         state, city = cities[i % len(cities)]
         suffix = "" if i < len(cities) else " West"
         rows.append({
-            "branch_id": f"BR-{i + 1:03d}",
+            "branch_id": f"BR{i + 1:03d}",
             "branch_name": f"Lumen {city}{suffix}",
             "city": city,
             "state": state,
